@@ -3,6 +3,7 @@ import json
 import pandas as pd
 import numpy as np
 import os
+import matplotlib.pyplot as plt
 
 with open("modelo.json", "r") as f:
     modelo_seguro = json.load(f)
@@ -18,6 +19,7 @@ def predict_seguro(age, bmi, smoker, children):
     )
     return f"${cost:.2f}"
 
+
 df = pd.read_csv("./seeds.csv", sep=r"\s+", header=None)
 df.columns = [
     "Area", "Perimeter", "Compactness", "Length of Kernel",
@@ -25,36 +27,54 @@ df.columns = [
 ]
 X = df.drop("Variety", axis=1).values
 y = df["Variety"].values
-X_norm = (X - X.min(axis=0)) / (X.max(axis=0) - X.min(axis=0))
+X = (X - X.min(axis=0)) / (X.max(axis=0) - X.min(axis=0))  # normalización min-max
 
 np.random.seed(0)
-indices = np.random.permutation(len(X_norm))
-train_size = int(0.7 * len(X_norm))
+indices = np.random.permutation(len(X))
+train_size = int(0.7 * len(X))
 train_idx, test_idx = indices[:train_size], indices[train_size:]
-X_train, y_train = X_norm[train_idx], y[train_idx]
-X_test, y_test = X_norm[test_idx], y[test_idx]
+X_train, y_train = X[train_idx], y[train_idx]
+X_test, y_test = X[test_idx], y[test_idx]
 
-modelo_path = "./modelo_centroides.npz"
-centroides = {}
+def sigmoid(z):
+    return 1 / (1 + np.exp(-z))
 
-if os.path.exists(modelo_path):
-    modelo = np.load(modelo_path)
-    centroides = {int(k): modelo[k] for k in modelo}
-else:
-    for clase in np.unique(y_train):
-        centroides[clase] = X_train[y_train == clase].mean(axis=0)
-    np.savez(modelo_path, **{str(k): v for k, v in centroides.items()})
+def loss_logistica(y, h):
+    m = y.shape[0]
+    return -1/m * np.sum(y * np.log(h + 1e-15) + (1 - y) * np.log(1 - h + 1e-15))
 
-def clasificar_semilla(area, perimeter, compactness, length_kernel, width_kernel, asymmetry, groove_length):
-    muestra = np.array([
-        area, perimeter, compactness, length_kernel,
-        width_kernel, asymmetry, groove_length
-    ])
-    min_vals = X.min(axis=0)
-    max_vals = X.max(axis=0)
-    muestra_norm = (muestra - min_vals) / (max_vals - min_vals)
-    distancias = {clase: np.linalg.norm(muestra_norm - centroide) for clase, centroide in centroides.items()}
-    prediccion = min(distancias, key=distancias.get)
+def entrenar_modelo_logistico(X, y, lr=0.1, epochs=1000):
+    m, n = X.shape
+    X_bias = np.c_[np.ones((m, 1)), X]
+    theta = np.zeros(n + 1)
+    historial = []
+
+    for _ in range(epochs):
+        z = np.dot(X_bias, theta)
+        h = sigmoid(z)
+        grad = np.dot(X_bias.T, (h - y)) / m
+        theta -= lr * grad
+        historial.append(loss_logistica(y, h))
+
+    return theta, historial
+
+def one_vs_rest(X, y, clases, lr=0.1, epochs=1000):
+    modelos = {}
+    historiales = {}
+    for c in clases:
+        y_binaria = (y == c).astype(int)
+        theta, hist = entrenar_modelo_logistico(X, y_binaria, lr, epochs)
+        modelos[c] = theta
+        historiales[c] = hist
+    return modelos, historiales
+
+clases = np.unique(y_train)
+modelos_ovr, historiales_log = one_vs_rest(X_train, y_train, clases)
+
+def predecir_clase(muestra, modelos):
+    X_muestra = np.insert(muestra, 0, 1)  # bias
+    probs = {clase: sigmoid(np.dot(X_muestra, theta)) for clase, theta in modelos.items()}
+    prediccion = max(probs, key=probs.get)
     return f"Clase predicha: {prediccion}"
 
 with gr.Blocks(title="App Multi-Modelo") as app:
@@ -71,7 +91,7 @@ with gr.Blocks(title="App Multi-Modelo") as app:
         btn_seguro.click(fn=predict_seguro, inputs=[edad, bmi, fumador, hijos], outputs=salida_seguro)
 
     with gr.Tab("Clasificación de Semillas"):
-        gr.Markdown("## Clasificador de Semillas por Centroide")
+        gr.Markdown("## Clasificador de Semillas con Regresión Logística OvR")
         area = gr.Number(label="Área (mm²)")
         perimeter = gr.Number(label="Perímetro (mm)")
         compactness = gr.Number(label="Compacidad")
@@ -81,10 +101,17 @@ with gr.Blocks(title="App Multi-Modelo") as app:
         groove_length = gr.Number(label="Longitud del surco (mm)")
         salida_semilla = gr.Textbox(label="Clase Predicha")
         btn_semilla = gr.Button("Clasificar")
+
+        def wrapper_pred(area, perimeter, compactness, length_kernel, width_kernel, asymmetry, groove_length):
+            muestra = np.array([area, perimeter, compactness, length_kernel,
+                                width_kernel, asymmetry, groove_length])
+            muestra = (muestra - X.min(axis=0)) / (X.max(axis=0) - X.min(axis=0))  # normalización
+            return predecir_clase(muestra, modelos_ovr)
+
         btn_semilla.click(
-            fn=clasificar_semilla,
+            fn=wrapper_pred,
             inputs=[area, perimeter, compactness, length_kernel, width_kernel, asymmetry, groove_length],
             outputs=salida_semilla
         )
 
-app.launch(share=True)
+app.launch()
